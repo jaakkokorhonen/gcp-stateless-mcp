@@ -41,13 +41,14 @@ const CLOUD_RUN_REVISION = process.env.K_REVISION ?? "unknown";
 
 // JSON-RPC dispatcher — notification-erottelu ja id-validointi
 async function dispatchRPC(message: JSONRPCMessage): Promise<JSONRPCMessage | null> {
-  const isNotification = message.method?.startsWith("notifications/");
+  const msg = message as any;
+  const isNotification = msg.method?.startsWith("notifications/");
 
   // Notification: ei id:tä, ei vastausta (fire-and-forget)
   if (isNotification) return null;
 
   // Non-notification ilman id:tä on malformed request (JSON-RPC 2.0 §4)
-  if ((message as { id?: unknown }).id === undefined) {
+  if (msg.id === undefined) {
     return {
       jsonrpc: "2.0",
       id: null,
@@ -58,28 +59,28 @@ async function dispatchRPC(message: JSONRPCMessage): Promise<JSONRPCMessage | nu
     };
   }
 
-  if (message.method === "initialize") {
+  if (msg.method === "initialize") {
     return {
       jsonrpc: "2.0",
-      id: message.id,
+      id: msg.id,
       result: {
         protocolVersion: "2024-11-05",
         capabilities: { tools: {} },
         serverInfo: { name: "mcp-gcp-server", version: "1.0.0" },
       },
-    };
+    } as any;
   }
 
-  if (message.method === "tools/list") {
+  if (msg.method === "tools/list") {
     return {
       jsonrpc: "2.0",
-      id: message.id,
+      id: msg.id,
       result: { tools: TOOLS },
-    };
+    } as any;
   }
 
-  if (message.method === "tools/call") {
-    const { name, arguments: args } = message.params as {
+  if (msg.method === "tools/call") {
+    const { name, arguments: args } = msg.params as {
       name: string;
       arguments: unknown;
     };
@@ -87,32 +88,32 @@ async function dispatchRPC(message: JSONRPCMessage): Promise<JSONRPCMessage | nu
     if (!handler) {
       return {
         jsonrpc: "2.0",
-        id: message.id,
+        id: msg.id,
         error: { code: -32601, message: `Tool not found: ${name}` },
-      };
+      } as any;
     }
     try {
       const result = await handler(args);
       return {
         jsonrpc: "2.0",
-        id: message.id,
+        id: msg.id,
         result: { content: [{ type: "text", text: JSON.stringify(result) }] },
-      };
+      } as any;
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Unknown error";
+      const errorMsg = err instanceof Error ? err.message : "Unknown error";
       return {
         jsonrpc: "2.0",
-        id: message.id,
-        error: { code: -32603, message: msg },
-      };
+        id: msg.id,
+        error: { code: -32603, message: errorMsg },
+      } as any;
     }
   }
 
   return {
     jsonrpc: "2.0",
-    id: (message as { id?: unknown }).id ?? null,
-    error: { code: -32601, message: `Method not found: ${message.method}` },
-  };
+    id: msg.id ?? null,
+    error: { code: -32601, message: `Method not found: ${msg.method}` },
+  } as any;
 }
 
 // POST handler — transport hoitaa framing/streaming, dispatcher JSON-RPC-logiikan
@@ -120,8 +121,20 @@ app.post("/mcp", async (req, res) => {
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined, // tilaton — ei session affinityä tarvita
   });
+
+  transport.onmessage = async (message) => {
+    try {
+      const response = await dispatchRPC(message);
+      if (response) {
+        await transport.send(response);
+      }
+    } catch (err) {
+      process.stderr.write(`Error in dispatchRPC: ${err}\n`);
+    }
+  };
+
   try {
-    await transport.handleRequest(req, res, req.body, dispatchRPC);
+    await transport.handleRequest(req, res, req.body);
     lastSuccessfulRequest = new Date();
   } catch (err) {
     if (!res.headersSent) {
