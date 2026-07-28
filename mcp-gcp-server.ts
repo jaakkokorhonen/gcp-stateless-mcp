@@ -148,13 +148,7 @@ app.post("/mcp", async (req, res) => {
 });
 
 // OPTIONS preflight — varautuminen tulevaan suoraan remote-yhteyteen
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN ?? "";
-if (!ALLOWED_ORIGIN) {
-  process.stderr.write(
-    JSON.stringify({ severity: "CRITICAL", message: "ALLOWED_ORIGIN env var not set" }) + "\n"
-  );
-  process.exit(1);
-}
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN ?? "*";
 
 app.options("/mcp", (_req, res) => {
   res.set({

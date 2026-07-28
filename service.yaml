@@ -8,6 +8,9 @@ spec:
     spec:
       containers:
         - image: europe-north1-docker.pkg.dev/uutisseuranta-activitystreams/mcp-servers/gcp-mcp:latest
+          env:
+            - name: ALLOWED_ORIGIN
+              value: "*"
           livenessProbe:
             httpGet:
               path: /healthz
