@@ -56,7 +56,7 @@ async function dispatchRPC(message: JSONRPCMessage): Promise<JSONRPCMessage | nu
         code: -32600,
         message: "Invalid Request: id is required for non-notification messages",
       },
-    };
+    } as any;
   }
 
   if (msg.method === "initialize") {
