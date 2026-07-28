@@ -1,0 +1,19 @@
+{
+  "name": "gcp-mcp-server",
+  "version": "1.0.0",
+  "description": "Remote MCP server for GCP on Cloud Run",
+  "main": "dist/mcp-gcp-server.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/mcp-gcp-server.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.15.0",
+    "express": "^4.19.2"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.12.7",
+    "typescript": "^5.4.5"
+  }
+}

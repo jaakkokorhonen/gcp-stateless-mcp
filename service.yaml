@@ -1,0 +1,21 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: mcp-gcp-server
+  namespace: uutisseuranta-activitystreams
+spec:
+  template:
+    spec:
+      containers:
+        - image: europe-north1-docker.pkg.dev/uutisseuranta-activitystreams/mcp-servers/gcp-mcp:latest
+          livenessProbe:
+            httpGet:
+              path: /healthz
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+            initialDelaySeconds: 5
+            periodSeconds: 5
