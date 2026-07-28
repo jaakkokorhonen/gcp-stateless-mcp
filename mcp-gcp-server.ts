@@ -4,7 +4,10 @@ import { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 
 const app = express();
 app.use(express.json());
-
+app.use((req, res, next) => {
+  process.stdout.write(`Received request: ${req.method} ${req.path}\n`);
+  next();
+});
 // Tool-määritykset — puhtaasti datana, ei SDK:n McpServer-rekisteröintinä
 const TOOLS = [
   {
