@@ -1,15 +1,17 @@
 {
   "name": "gcp-mcp-server",
-  "version": "1.0.0",
-  "description": "Remote MCP server for GCP on Cloud Run",
+  "version": "2.0.0",
+  "description": "Remote MCP server for GCP on Cloud Run — dynamic GCP Discovery API proxy",
   "main": "dist/mcp-gcp-server.js",
   "scripts": {
     "build": "tsc",
-    "start": "node dist/mcp-gcp-server.js"
+    "start": "node dist/mcp-gcp-server.js",
+    "dev": "tsc && node dist/mcp-gcp-server.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.15.0",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "google-auth-library": "^9.15.0"
   },
   "devDependencies": {
     "@types/express": "^4.17.21",

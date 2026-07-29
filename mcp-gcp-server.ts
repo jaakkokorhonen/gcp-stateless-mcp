@@ -1,20 +1,75 @@
+/**
+ * mcp-gcp-server.ts
+ *
+ * Tilaton MCP-palvelin (Model Context Protocol) Google Cloud Run -alustalle.
+ * Käyttää Streamable HTTP -transporttia — ei session affinitya tarvita.
+ *
+ * Tarjoaa kolme dynaamista työkalua GCP:n kaikkiin REST API -rajapintoihin:
+ *   - list_gcp_apis     : hakee saatavilla olevat API:t Discovery Serviceltä
+ *   - describe_gcp_api  : palauttaa yhden API-version metodilistan
+ *   - call_gcp_api      : suorittaa minkä tahansa GCP REST -metodin
+ *
+ * Autentikointi:
+ *   Cloud Run -ympäristössä ADC toimii automaattisesti GCP metadata-serverin
+ *   kautta. Lokaalikehityksessä käytetään google-auth-library -pakettia ja
+ *   gcloud-sovelluskredentiaalia (ks. UNIT-TESTAUS TUOTANTOAUTENTIKOINNILLA).
+ *
+ * UNIT-TESTAUS TUOTANTOAUTENTIKOINNILLA
+ * ─────────────────────────────────────
+ * 1. Kirjaudu gcloudiin kehittäjätunnuksilla:
+ *      gcloud auth application-default login
+ *    Tämä kirjoittaa ~/.config/gcloud/application_default_credentials.json
+ *    jota google-auth-library löytää automaattisesti GOOGLE_APPLICATION_CREDENTIALS
+ *    -ympäristömuuttujasta tai oletuspoluista.
+ *
+ * 2. Aseta kohde-projekti:
+ *      export GCLOUD_PROJECT=uutisseuranta-activitystreams
+ *
+ * 3. Käynnistä palvelin lokaalisti:
+ *      npm run build && node dist/mcp-gcp-server.js
+ *
+ * 4. Testaa yksittäistä työkalua suoraan HTTP:llä:
+ *      curl -X POST http://localhost:8080/mcp \
+ *        -H 'Content-Type: application/json' \
+ *        -d '{
+ *          "jsonrpc": "2.0",
+ *          "id": 1,
+ *          "method": "tools/call",
+ *          "params": {
+ *            "name": "list_gcp_apis",
+ *            "arguments": { "filter": "run" }
+ *          }
+ *        }'
+ *
+ * 5. Testaa call_gcp_api -kutsulla tuotannon Cloud Run -palveluilla:
+ *      Vaihda path_params-arvot vastaamaan omaa projektiasi.
+ *
+ * HUOM: gcloud auth application-default -tunnisteet antavat kehittäjän
+ * omat oikeudet. Testaa vain resursseilla joihin sinulla on lupa.
+ */
+
 import express, { Request, Response, NextFunction } from "express";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 
 const app = express();
 app.use(express.json());
+
+// Pyyntöloki — kirjataan Cloud Loggingiin stdout:n kautta
 app.use((req, res, next) => {
   process.stdout.write(`Received request: ${req.method} ${req.path}\n`);
   next();
 });
 
 // ---------------------------------------------------------------------------
-// ADC-token helper — hakee access tokenin GCP metadata-serveriltä (Cloud Run)
-// tai GOOGLE_APPLICATION_CREDENTIALS-ympäristömuuttujasta (lokaali kehitys)
+// ADC-TOKEN HELPER
+// Hakee GCP Bearer-tokenin kahdella tavalla tärkeysjärjestyksessä:
+//   1. GCP metadata-serveri (toimii Cloud Runissa automaattisesti)
+//   2. google-auth-library + application_default_credentials (lokaalikehitys)
 // ---------------------------------------------------------------------------
 async function getAccessToken(): Promise<string> {
-  // Cloud Run: metadata-serveri antaa tokenin automaattisesti
+  // Yritys 1: Cloud Run -metadata-serveri
+  // Timeout 2 s — jos ei vastaa, ollaan todennäköisesti lokaalissa ympäristössä
   const metadataUrl =
     "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token";
   try {
@@ -27,10 +82,12 @@ async function getAccessToken(): Promise<string> {
       return data.access_token;
     }
   } catch {
-    // ei Cloud Run -ympäristössä, yritetään seuraavaa
+    // Metadata-serveri ei vastannut — siirrytään seuraavaan
   }
 
-  // Lokaalikehitys: google-auth-library (valinnainen riippuvuus)
+  // Yritys 2: google-auth-library (lokaalikehitys)
+  // Vaatii: gcloud auth application-default login
+  // Paketti ladataan dynaamisesti, joten se ei kaada palvelinta jos puuttuu
   try {
     const { GoogleAuth } = await import("google-auth-library");
     const auth = new GoogleAuth({
@@ -40,40 +97,46 @@ async function getAccessToken(): Promise<string> {
     const tokenRes = await client.getAccessToken();
     if (tokenRes.token) return tokenRes.token;
   } catch {
-    // google-auth-library ei ole asennettuna
+    // google-auth-library ei löydy tai autentikointi epäonnistui
   }
 
   throw new Error(
-    "Ei pystytty hakemaan GCP access tokenia. " +
-      "Varmista että palvelu pyörii Cloud Runissa tai GOOGLE_APPLICATION_CREDENTIALS on asetettu."
+    "GCP access token -haku epäonnistui. " +
+      "Cloud Run: varmista service accountin IAM-oikeudet. " +
+      "Lokaali: aja 'gcloud auth application-default login'."
   );
 }
 
 // ---------------------------------------------------------------------------
-// Discovery-cache — vähennetään ulkoisia HTTP-kutsuja
+// DISCOVERY-CACHE
+// Discovery Service -haku on hidas (~200–400 ms) ja muuttuu harvoin.
+// Välimuisti pitää tulokset muistissa 1 tunnin ajan per prosessi-instanssi.
+// Tilaton Cloud Run nollaa välimuistin uuden instanssin käynnistyksen yhteydessä.
 // ---------------------------------------------------------------------------
 interface DiscoveryItem {
-  name: string;
-  version: string;
-  title: string;
-  description: string;
+  name: string;             // API:n tunniste, esim. "run", "storage"
+  version: string;          // Versio, esim. "v2", "v1beta1"
+  title: string;            // Luettava nimi, esim. "Cloud Run Admin API"
+  description: string;      // Lyhyt kuvaus
   documentationLink?: string;
-  discoveryRestUrl?: string;
+  discoveryRestUrl?: string; // URL josta API:n skeema haetaan
 }
 
 let discoveryCache: DiscoveryItem[] | null = null;
 let discoveryCacheTime = 0;
-const DISCOVERY_CACHE_TTL_MS = 60 * 60 * 1000; // 1 h
+const DISCOVERY_CACHE_TTL_MS = 60 * 60 * 1000; // 1 tunti
 
+/** Hakee kaikki Google API:t Discovery Serviceltä, välimuistilla. */
 async function fetchDiscoveryList(): Promise<DiscoveryItem[]> {
   const now = Date.now();
   if (discoveryCache && now - discoveryCacheTime < DISCOVERY_CACHE_TTL_MS) {
     return discoveryCache;
   }
   const res = await fetch(
-    "https://discovery.googleapis.com/discovery/v1/apis?fields=items(name,version,title,description,documentationLink,discoveryRestUrl)"
+    "https://discovery.googleapis.com/discovery/v1/apis" +
+      "?fields=items(name,version,title,description,documentationLink,discoveryRestUrl)"
   );
-  if (!res.ok) throw new Error(`Discovery list fetch failed: ${res.status}`);
+  if (!res.ok) throw new Error(`Discovery-lista haku epäonnistui: ${res.status}`);
   const data = (await res.json()) as { items: DiscoveryItem[] };
   discoveryCache = data.items ?? [];
   discoveryCacheTime = now;
@@ -81,19 +144,26 @@ async function fetchDiscoveryList(): Promise<DiscoveryItem[]> {
 }
 
 // Yksittäisen API:n discovery-dokumentti (metodit, skeema, baseUrl)
+// Tätä ei vanhenneta — API-skeema muuttuu vain uuden version julkaisun yhteydessä
 const apiDocCache: Record<string, unknown> = {};
 
+/** Hakee yhden API-version täydellisen discovery-dokumentin, välimuistilla. */
 async function fetchApiDoc(discoveryRestUrl: string): Promise<unknown> {
   if (apiDocCache[discoveryRestUrl]) return apiDocCache[discoveryRestUrl];
   const res = await fetch(discoveryRestUrl);
-  if (!res.ok) throw new Error(`API doc fetch failed: ${res.status} ${discoveryRestUrl}`);
+  if (!res.ok)
+    throw new Error(`API-dokumentti haku epäonnistui: ${res.status} ${discoveryRestUrl}`);
   const doc = await res.json();
   apiDocCache[discoveryRestUrl] = doc;
   return doc;
 }
 
 // ---------------------------------------------------------------------------
-// URL-template renderer — korvaa {param} -placeholderit arvoilla
+// URL-TEMPLATE RENDERER
+// GCP REST -polut sisältävät {param} -placeholdereita, esim.:
+//   "projects/{projectsId}/locations/{locationsId}/services"
+// Tämä funktio korvaa ne path_params-arvoilla ja palauttaa
+// käyttämättömät avaimet query-parametreiksi.
 // ---------------------------------------------------------------------------
 function renderUrlTemplate(
   template: string,
@@ -106,12 +176,18 @@ function renderUrlTemplate(
       delete unused[key];
       return encodeURIComponent(val);
     }
-    return "";
+    return ""; // puuttuva parametri jätetään tyhjäksi
   });
   return { url, unusedParams: unused };
 }
 
-// Rekursiivinen metodilistaus discovery-dokumentin resources-puusta
+// ---------------------------------------------------------------------------
+// METODILISTAUS
+// Discovery-dokumentin resources-puu on rekursiivinen:
+//   resources.projects.resources.locations.methods.list
+// Tämä funktio kävelee puun läpi ja kerää kaikki metodit
+// pistenotaatiolla ilmaistuine id:ineen (esim. "projects.locations.services.list").
+// ---------------------------------------------------------------------------
 interface MethodInfo {
   id: string;
   path: string;
@@ -126,49 +202,53 @@ function collectMethods(
   prefix = ""
 ): MethodInfo[] {
   const result: MethodInfo[] = [];
+
+  // Tason omat metodit
   if (methods) {
     for (const [name, m] of Object.entries(methods as Record<string, MethodInfo>)) {
       result.push({ ...m, id: prefix ? `${prefix}.${name}` : name });
     }
   }
+
+  // Rekursiivinen alipuiden käsittely
   if (resources) {
-    for (const [rName, r] of Object.entries(resources as Record<string, { methods?: unknown; resources?: unknown }>)) {
-      const sub = r as { methods?: Record<string, MethodInfo>; resources?: Record<string, unknown> };
-      result.push(...collectMethods(sub.resources, sub.methods, prefix ? `${prefix}.${rName}` : rName));
+    for (const [rName, r] of Object.entries(
+      resources as Record<string, { methods?: unknown; resources?: unknown }>
+    )) {
+      const sub = r as {
+        methods?: Record<string, MethodInfo>;
+        resources?: Record<string, unknown>;
+      };
+      result.push(
+        ...collectMethods(
+          sub.resources,
+          sub.methods,
+          prefix ? `${prefix}.${rName}` : rName
+        )
+      );
     }
   }
   return result;
 }
 
 // ---------------------------------------------------------------------------
-// Tool-määritykset
+// TOOL-MÄÄRITYKSET
+// Rekisteröidään MCP-asiakkaille tools/list -vastauksessa.
+// inputSchema noudattaa JSON Schema Draft-07 -muotoa.
 // ---------------------------------------------------------------------------
 const TOOLS = [
-  // --- Alkuperäinen työkalu (säilytetty) ---
-  {
-    name: "get_project_status",
-    description: "Returns current GCP project status (stub)",
-    inputSchema: {
-      type: "object",
-      properties: {
-        projectId: { type: "string", description: "GCP project ID" },
-      },
-      required: ["projectId"],
-    },
-  },
-
-  // --- Uudet dynaamiset työkalut ---
   {
     name: "list_gcp_apis",
     description:
       "Lists available Google Cloud REST APIs from the Discovery Service. " +
-      "Optionally filter by name keyword (e.g. 'run', 'storage', 'bigquery').",
+      "Optionally filter by name keyword (e.g. 'run', 'storage', 'bigquery'). " +
+      "Results are cached for 1 hour per server instance.",
     inputSchema: {
       type: "object",
       properties: {
         filter: {
           type: "string",
-          description: "Optional keyword to filter API names (case-insensitive)",
+          description: "Optional keyword to filter API names or titles (case-insensitive)",
         },
       },
     },
@@ -177,18 +257,19 @@ const TOOLS = [
   {
     name: "describe_gcp_api",
     description:
-      "Returns available methods for a specific GCP API version. " +
+      "Returns all available methods for a specific GCP API version, " +
+      "including HTTP method, URL path template, and required parameters. " +
       "Use list_gcp_apis first to find the correct api name and version.",
     inputSchema: {
       type: "object",
       properties: {
         api: {
           type: "string",
-          description: "API name, e.g. 'run', 'storage', 'bigquery'",
+          description: "API name from list_gcp_apis, e.g. 'run', 'storage', 'bigquery'",
         },
         version: {
           type: "string",
-          description: "API version, e.g. 'v2', 'v1', 'v1beta1'",
+          description: "API version from list_gcp_apis, e.g. 'v2', 'v1', 'v1beta1'",
         },
       },
       required: ["api", "version"],
@@ -198,10 +279,11 @@ const TOOLS = [
   {
     name: "call_gcp_api",
     description:
-      "Calls any GCP REST API method dynamically. " +
-      "Use describe_gcp_api to find the correct method id and required parameters. " +
-      "Path parameters (e.g. projectId, location) go into path_params; " +
-      "query parameters go into query_params; request body goes into body.",
+      "Calls any GCP REST API method dynamically using the current service account. " +
+      "Use describe_gcp_api to discover the correct method_id and path parameters. " +
+      "path_params: URL path placeholders (e.g. projectsId, locationsId). " +
+      "query_params: URL query string parameters. " +
+      "body: JSON request body for POST/PATCH/PUT methods.",
     inputSchema: {
       type: "object",
       properties: {
@@ -215,16 +297,17 @@ const TOOLS = [
         },
         method_id: {
           type: "string",
-          description: "Method id from describe_gcp_api, e.g. 'projects.locations.services.list'",
+          description:
+            "Method id from describe_gcp_api, e.g. 'projects.locations.services.list'",
         },
         path_params: {
           type: "object",
-          description: "URL path parameters as key-value pairs",
+          description: "URL path parameters as key-value pairs, e.g. { projectsId: 'my-project' }",
           additionalProperties: { type: "string" },
         },
         query_params: {
           type: "object",
-          description: "Query string parameters as key-value pairs",
+          description: "Query string parameters, e.g. { pageSize: '10' }",
           additionalProperties: { type: "string" },
         },
         body: {
@@ -238,14 +321,18 @@ const TOOLS = [
 ];
 
 // ---------------------------------------------------------------------------
-// Tool-toteutukset
+// TOOL-TOTEUTUKSET
+// Jokainen handler vastaa yhtä TOOLS-taulun merkintää.
+// Handlerit heittävät Error-olion virhetilanteissa —
+// dispatchRPC muuntaa ne JSON-RPC -32603 -virhevastauksiksi.
 // ---------------------------------------------------------------------------
 const toolHandlers: Record<string, (args: unknown) => Promise<unknown>> = {
-  get_project_status: async (args) => {
-    const { projectId } = args as { projectId: string };
-    return { status: "active", projectId };
-  },
 
+  /**
+   * list_gcp_apis
+   * Hakee Discovery Service -hakemiston ja suodattaa tulokset.
+   * Välimuisti päivittyy kerran tunnissa.
+   */
   list_gcp_apis: async (args) => {
     const { filter } = (args ?? {}) as { filter?: string };
     const items = await fetchDiscoveryList();
@@ -253,7 +340,7 @@ const toolHandlers: Record<string, (args: unknown) => Promise<unknown>> = {
       ? items.filter(
           (i) =>
             i.name.toLowerCase().includes(filter.toLowerCase()) ||
-            i.title?.toLowerCase().includes(filter.toLowerCase())
+            (i.title ?? "").toLowerCase().includes(filter.toLowerCase())
         )
       : items;
     return filtered.map((i) => ({
@@ -265,6 +352,11 @@ const toolHandlers: Record<string, (args: unknown) => Promise<unknown>> = {
     }));
   },
 
+  /**
+   * describe_gcp_api
+   * Hakee yksittäisen API-version discovery-dokumentin ja
+   * kerää siitä kaikkien metodien metatiedot rekursiivisesti.
+   */
   describe_gcp_api: async (args) => {
     const { api, version } = args as { api: string; version: string };
     const items = await fetchDiscoveryList();
@@ -272,14 +364,19 @@ const toolHandlers: Record<string, (args: unknown) => Promise<unknown>> = {
       (i) => i.name === api && i.version === version && i.discoveryRestUrl
     );
     if (!entry?.discoveryRestUrl) {
-      throw new Error(`API '${api}' version '${version}' not found in Discovery Service`);
+      throw new Error(
+        `API '${api}' versio '${version}' ei löydy Discovery Serviceltä`
+      );
     }
     const doc = (await fetchApiDoc(entry.discoveryRestUrl)) as {
       baseUrl?: string;
       resources?: Record<string, unknown>;
       methods?: Record<string, unknown>;
     };
-    const methods = collectMethods(doc.resources, doc.methods as Record<string, MethodInfo>);
+    const methods = collectMethods(
+      doc.resources,
+      doc.methods as Record<string, MethodInfo>
+    );
     return {
       api,
       version,
@@ -294,6 +391,16 @@ const toolHandlers: Record<string, (args: unknown) => Promise<unknown>> = {
     };
   },
 
+  /**
+   * call_gcp_api
+   * Rakentaa GCP REST -kutsun discovery-dokumentin tietojen pohjalta:
+   *   1. Hae discovery-dokumentti (välimuistista tai verkosta)
+   *   2. Etsi metodi method_id:llä
+   *   3. Renderöi URL-template path_params-arvoilla
+   *   4. Lisää query_params URL:iin
+   *   5. Hae Bearer-token ADC:ltä
+   *   6. Suorita HTTP-kutsu ja palauta JSON-vastaus
+   */
   call_gcp_api: async (args) => {
     const {
       api,
@@ -311,13 +418,13 @@ const toolHandlers: Record<string, (args: unknown) => Promise<unknown>> = {
       body?: unknown;
     };
 
-    // Hae discovery-dokumentti
+    // Vaihe 1: hae discovery-dokumentti
     const items = await fetchDiscoveryList();
     const entry = items.find(
       (i) => i.name === api && i.version === version && i.discoveryRestUrl
     );
     if (!entry?.discoveryRestUrl) {
-      throw new Error(`API '${api}' version '${version}' not found`);
+      throw new Error(`API '${api}' versio '${version}' ei löydy`);
     }
     const doc = (await fetchApiDoc(entry.discoveryRestUrl)) as {
       baseUrl: string;
@@ -325,7 +432,7 @@ const toolHandlers: Record<string, (args: unknown) => Promise<unknown>> = {
       methods?: Record<string, unknown>;
     };
 
-    // Etsi metodi
+    // Vaihe 2: etsi metodi pistenotaatiolla
     const allMethods = collectMethods(
       doc.resources,
       doc.methods as Record<string, MethodInfo>
@@ -333,12 +440,12 @@ const toolHandlers: Record<string, (args: unknown) => Promise<unknown>> = {
     const method = allMethods.find((m) => m.id === method_id);
     if (!method) {
       throw new Error(
-        `Method '${method_id}' not found in ${api}@${version}. ` +
-          `Use describe_gcp_api to list available methods.`
+        `Metodia '${method_id}' ei löydy API:sta ${api}@${version}. ` +
+          `Käytä describe_gcp_api saadaksesi saatavilla olevat metodit.`
       );
     }
 
-    // Rakenna URL
+    // Vaihe 3: renderöi URL-template
     const baseUrl = doc.baseUrl.replace(/\/$/, "");
     const pathTemplate = method.path.replace(/^\//, "");
     const { url: renderedPath, unusedParams } = renderUrlTemplate(
@@ -347,7 +454,9 @@ const toolHandlers: Record<string, (args: unknown) => Promise<unknown>> = {
     );
     const fullUrl = new URL(`${baseUrl}/${renderedPath}`);
 
-    // Query-parametrit: unused path_params + explicit query_params
+    // Vaihe 4: lisää query-parametrit
+    // unusedParams = path_params-arvot joita ei löydetty URL-templatesta
+    // → siirretään query stringiin automaattisesti
     for (const [k, v] of Object.entries(unusedParams)) {
       fullUrl.searchParams.set(k, v);
     }
@@ -355,10 +464,10 @@ const toolHandlers: Record<string, (args: unknown) => Promise<unknown>> = {
       fullUrl.searchParams.set(k, v);
     }
 
-    // Autentikointi
+    // Vaihe 5: hae Bearer-token
     const token = await getAccessToken();
 
-    // HTTP-kutsu
+    // Vaihe 6: suorita HTTP-kutsu
     const fetchOptions: RequestInit = {
       method: method.httpMethod,
       headers: {
@@ -373,6 +482,7 @@ const toolHandlers: Record<string, (args: unknown) => Promise<unknown>> = {
     const apiRes = await fetch(fullUrl.toString(), fetchOptions);
     const responseText = await apiRes.text();
 
+    // JSON-parsinta — virheen sattuessa palautetaan raakamerkkijono
     let responseData: unknown;
     try {
       responseData = JSON.parse(responseText);
@@ -382,7 +492,7 @@ const toolHandlers: Record<string, (args: unknown) => Promise<unknown>> = {
 
     if (!apiRes.ok) {
       throw new Error(
-        `GCP API error ${apiRes.status}: ${JSON.stringify(responseData)}`
+        `GCP API virhe ${apiRes.status}: ${JSON.stringify(responseData)}`
       );
     }
 
@@ -391,37 +501,49 @@ const toolHandlers: Record<string, (args: unknown) => Promise<unknown>> = {
 };
 
 // ---------------------------------------------------------------------------
-// Health check
+// HEALTH CHECK -TILA
+// Kolme tilaa kuvaavat palvelimen elinkaarta:
+//   starting  — käynnistymisikkuna (30 s), ei merkki ongelmasta
+//   ok        — viimeisestä onnistuneesta pyynnöstä alle 5 min
+//   degraded  — liian kauan ilman onnistunutta pyyntöä (503)
+// Cloud Run käyttää /healthz:ta startup- ja liveness-tarkistuksiin.
 // ---------------------------------------------------------------------------
 type HealthState = "starting" | "ok" | "degraded";
 
 let lastSuccessfulRequest: Date | null = null;
 const serverStartTime: Date = new Date();
-const HEALTH_STALE_THRESHOLD_MS = 5 * 60 * 1000;
-const STARTUP_GRACE_MS = 30 * 1000;
+const HEALTH_STALE_THRESHOLD_MS = 5 * 60 * 1000; // 5 minuuttia
+const STARTUP_GRACE_MS = 30 * 1000;              // 30 sekunnin käynnistysikkuna
 
 const DEPLOYED_SHA = process.env.DEPLOY_SHA ?? "unknown";
 const CLOUD_RUN_REVISION = process.env.K_REVISION ?? "unknown";
 
 // ---------------------------------------------------------------------------
-// JSON-RPC dispatcher
+// JSON-RPC DISPATCHER
+// Käsittelee MCP-protokollan viestit metodin mukaan.
+// Notification-viestit (notifications/*) ovat fire-and-forget — ei vastausta.
+// Kaikki muut viestit vaativat id-kentän (JSON-RPC 2.0 §4).
 // ---------------------------------------------------------------------------
 async function dispatchRPC(message: JSONRPCMessage): Promise<JSONRPCMessage | null> {
   const msg = message as any;
+
+  // Notifikaatiot: asiakas ei odota vastausta
   const isNotification = msg.method?.startsWith("notifications/");
   if (isNotification) return null;
 
+  // Malformed request: ei-notifikaatio ilman id:tä
   if (msg.id === undefined) {
     return {
       jsonrpc: "2.0",
       id: null,
       error: {
         code: -32600,
-        message: "Invalid Request: id is required for non-notification messages",
+        message: "Invalid Request: id vaaditaan ei-notifikaatioviesteissä",
       },
     } as any;
   }
 
+  // MCP-kättely: palautetaan protokollaversio ja capabilities
   if (msg.method === "initialize") {
     return {
       jsonrpc: "2.0",
@@ -434,6 +556,7 @@ async function dispatchRPC(message: JSONRPCMessage): Promise<JSONRPCMessage | nu
     } as any;
   }
 
+  // Työkalujen listaus
   if (msg.method === "tools/list") {
     return {
       jsonrpc: "2.0",
@@ -442,6 +565,7 @@ async function dispatchRPC(message: JSONRPCMessage): Promise<JSONRPCMessage | nu
     } as any;
   }
 
+  // Työkalun suoritus
   if (msg.method === "tools/call") {
     const { name, arguments: args } = msg.params as {
       name: string;
@@ -452,7 +576,7 @@ async function dispatchRPC(message: JSONRPCMessage): Promise<JSONRPCMessage | nu
       return {
         jsonrpc: "2.0",
         id: msg.id,
-        error: { code: -32601, message: `Tool not found: ${name}` },
+        error: { code: -32601, message: `Työkalu '${name}' ei löydy` },
       } as any;
     }
     try {
@@ -463,7 +587,7 @@ async function dispatchRPC(message: JSONRPCMessage): Promise<JSONRPCMessage | nu
         result: { content: [{ type: "text", text: JSON.stringify(result) }] },
       } as any;
     } catch (err) {
-      const errorMsg = err instanceof Error ? err.message : "Unknown error";
+      const errorMsg = err instanceof Error ? err.message : "Tuntematon virhe";
       return {
         jsonrpc: "2.0",
         id: msg.id,
@@ -472,19 +596,26 @@ async function dispatchRPC(message: JSONRPCMessage): Promise<JSONRPCMessage | nu
     }
   }
 
+  // Tuntematon metodi
   return {
     jsonrpc: "2.0",
     id: msg.id ?? null,
-    error: { code: -32601, message: `Method not found: ${msg.method}` },
+    error: { code: -32601, message: `Metodia ei löydy: ${msg.method}` },
   } as any;
 }
 
 // ---------------------------------------------------------------------------
-// Express-reitit
+// EXPRESS-REITIT
 // ---------------------------------------------------------------------------
+
+/**
+ * POST /mcp — pääreitti kaikelle MCP-liikenteelle.
+ * StreamableHTTPServerTransport hoitaa framing/streamingin,
+ * dispatchRPC JSON-RPC-logiikan.
+ */
 app.post("/mcp", async (req, res) => {
   const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: undefined,
+    sessionIdGenerator: undefined, // tilaton — ei session affinitya
   });
 
   transport.onmessage = async (message) => {
@@ -492,7 +623,7 @@ app.post("/mcp", async (req, res) => {
       const response = await dispatchRPC(message);
       if (response) await transport.send(response);
     } catch (err) {
-      process.stderr.write(`Error in dispatchRPC: ${err}\n`);
+      process.stderr.write(`dispatchRPC virhe: ${err}\n`);
     }
   };
 
@@ -503,13 +634,14 @@ app.post("/mcp", async (req, res) => {
     if (!res.headersSent) {
       res.status(500).json({
         jsonrpc: "2.0",
-        error: { code: -32603, message: "Internal server error" },
+        error: { code: -32603, message: "Sisäinen palvelinvirhe" },
         id: null,
       });
     }
   }
 });
 
+/** OPTIONS /mcp — CORS preflight tulevaa suoraa remote-yhteyttä varten */
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN ?? "*";
 
 app.options("/mcp", (_req, res) => {
@@ -521,10 +653,15 @@ app.options("/mcp", (_req, res) => {
   res.status(204).send();
 });
 
+/** Muut metodit /mcp-reitillä hylätään */
 app.use("/mcp", (_req, res) => {
   res.status(405).json({ error: "Method Not Allowed" });
 });
 
+/**
+ * GET /healthz — Cloud Runin startup- ja liveness-probe.
+ * Palauttaa 200 tiloissa 'starting' ja 'ok', 503 tilassa 'degraded'.
+ */
 app.get("/healthz", (_req, res) => {
   const now = Date.now();
   const inGrace = now - serverStartTime.getTime() < STARTUP_GRACE_MS;
@@ -532,7 +669,8 @@ app.get("/healthz", (_req, res) => {
   if (lastSuccessfulRequest === null) {
     state = inGrace ? "starting" : "degraded";
   } else {
-    const stale = now - lastSuccessfulRequest.getTime() > HEALTH_STALE_THRESHOLD_MS;
+    const stale =
+      now - lastSuccessfulRequest.getTime() > HEALTH_STALE_THRESHOLD_MS;
     state = stale ? "degraded" : "ok";
   }
   const statusCode = state === "degraded" ? 503 : 200;
@@ -545,6 +683,7 @@ app.get("/healthz", (_req, res) => {
   });
 });
 
+/** Globaali virheenkäsittely — kirjataan strukturoidusti Cloud Loggingiin */
 app.use((err: Error, req: Request, res: Response, _next: NextFunction) => {
   process.stderr.write(
     JSON.stringify({
@@ -556,12 +695,15 @@ app.use((err: Error, req: Request, res: Response, _next: NextFunction) => {
   );
   res.status(500).json({
     jsonrpc: "2.0",
-    error: { code: -32603, message: "Internal server error" },
+    error: { code: -32603, message: "Sisäinen palvelinvirhe" },
     id: null,
   });
 });
 
+// ---------------------------------------------------------------------------
+// KÄYNNISTYS
+// ---------------------------------------------------------------------------
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
-  process.stdout.write(`Server listening on port ${PORT}\n`);
+  process.stdout.write(`MCP GCP -palvelin kuuntelee portissa ${PORT}\n`);
 });
